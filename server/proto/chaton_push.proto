@@ -1,0 +1,142 @@
+// ChatON push-channel protobuf schema.
+//
+// Reverse-engineered from the decompiled classes in `com.sec.a.a.a.*`
+// (MsgFrontendCommon.java = the type registry `ap`). Field numbers and wire
+// types are read directly from each class's `writeTo(CodedOutputStream)`.
+// The frontend type byte for each message comes from `ap.a(Object)`:
+//
+//   0 InitRequest (l)          7 PingReply (x)
+//   1 InitReply (i)            8 NotiElement (r)
+//   2 RegistrationRequest (am) 9 NotiGroup (u)
+//   3 RegistrationReply (aj)  10 NotiAcks (o)
+//   4 DeregistrationRequest(f)11 ProvisionRequest (ag)
+//   5 DeregistrationReply (c) 12 ProvisionReply (ad)
+//   6 PingRequest (aa)
+//
+// proto2 because the client is protobuf-lite gen'd from proto2 (optional/required
+// semantics, explicit field presence). `writeBytes` fields are declared `bytes`
+// to stay lossless on the wire even though the client often reads them as UTF-8
+// strings (helpers in proto.js convert when a value is known to be text).
+
+syntax = "proto2";
+
+package chaton.push;
+
+// --- type 0 --- l.writeTo: writeInt32(1), writeBytes(2)
+message InitRequest {
+  optional int32 async_id    = 1;   // per-request correlation id (util.d.a())
+  optional bytes push_reg_id = 2;   // j.b(null) — device push registration id
+}
+
+// --- type 1 --- i.writeTo: writeInt32(1), writeInt32(2), writeBytes(3)
+// Client (push/c/a/b.java): result = f() [field 1], async_id = d() [field 2];
+// requires async_id == request.async_id, and result == 1000 for success.
+message InitReply {
+  optional int32 result   = 1;      // 1000 = OK; 4002/4006 => reconnect+reprov
+  optional int32 async_id = 2;      // echoes InitRequest.async_id
+  optional bytes payload  = 3;      // session/opaque; unused by client on success
+}
+
+// --- type 2 --- am.writeTo: writeInt32(1), writeBytes(2), writeBytes(3), writeBytes(4)
+message RegistrationRequest {
+  optional int32 async_id    = 1;
+  optional bytes push_reg_id = 2;   // j.b(null)
+  optional bytes app_id      = 3;   // registered application id
+  optional bytes extra       = 4;
+}
+
+// --- type 3 --- aj.writeTo: writeInt32(1), writeInt32(2), writeBytes(3..5)
+// Client (push/c/a/h.java): result = f() [field 1]; 1000 = success.
+message RegistrationReply {
+  optional int32 result   = 1;      // 1000 = OK
+  optional int32 async_id = 2;      // echoes request async_id
+  optional bytes reg_id   = 3;      // assigned push registration id
+  optional bytes field4   = 4;
+  optional bytes field5   = 5;
+}
+
+// --- type 4 --- f (DeregistrationRequest) — fields TBD, trace push/c/a/a.java
+message DeregistrationRequest {
+  optional int32 async_id    = 1;
+  optional bytes push_reg_id = 2;
+}
+
+// --- type 5 --- c (DeregistrationReply)
+message DeregistrationReply {
+  optional int32 result   = 1;
+  optional int32 async_id = 2;
+}
+
+// --- type 6 --- aa.writeTo: writeInt32(1), writeInt64(2), writeInt32(3)
+// Client (push/c/a/e.java): field1 = async id, field2 = System.currentTimeMillis()
+message PingRequest {
+  optional int32 async_id  = 1;
+  optional int64 timestamp = 2;
+  optional int32 field3    = 3;
+}
+
+// --- type 7 --- x.writeTo: writeInt32(1), writeInt64(2), writeInt32(3)
+message PingReply {
+  optional int32 async_id  = 1;     // echo
+  optional int64 timestamp = 2;     // echo
+  optional int32 field3    = 3;
+}
+
+// --- type 8 --- r.writeTo: bytes(1,2), int32(3,4), bytes(5,6,7), int64(11), int32(12), bytes(13)
+// A single push notification element (a delivered event: message, buddy event, etc.)
+message NotiElement {
+  optional bytes noti_id   = 1;
+  optional bytes sender    = 2;
+  optional int32 type      = 3;
+  optional int32 subtype   = 4;
+  optional bytes target    = 5;
+  optional bytes body      = 6;     // payload (often JSON/text)
+  optional bytes extra     = 7;
+  optional int64 timestamp = 11;
+  optional int32 seq       = 12;
+  optional bytes aux       = 13;
+}
+
+// --- type 9 --- u.writeTo: writeMessage(1, repeated) — a batch of NotiElement
+message NotiGroup {
+  repeated NotiElement elements = 1;
+}
+
+// --- type 10 --- o.writeTo: writeBytes(1), writeBytes(2, repeated)
+message NotiAcks {
+  optional bytes  session = 1;
+  repeated bytes  ids     = 2;      // ids of NotiElements the client acknowledges
+}
+
+// --- type 11 --- ag.writeTo: bytes(2..6) (+ optional int32 field 1)
+// Push-side provisioning request. The push client connects to
+// gld.push.samsungosp.com:5223 FIRST and sends this to learn the real message
+// server address (push/c/a/f.java = ProvMessageTask). Builder sets version "1",
+// "00000000", deviceId, a device.model/sim/net info string, and (if present) a
+// device token.
+message ProvisionRequest {
+  optional int32 async_id    = 1;
+  optional bytes version     = 2;
+  optional bytes reserved    = 3;
+  optional bytes device_id   = 4;
+  optional bytes device_info = 5;
+  optional bytes device_token = 6;
+}
+
+// --- type 12 --- ad.writeTo: int32(2), bytes(3), bytes(4), int32(5), bytes(6),
+//                 int32(7), int32(8), bytes(9)
+// Handler (push/c/a/f.java): result=d()[f2]; on 1000 it stores via j.a():
+//   f()[f3]=deviceToken, h()[f4]=primaryIp, j()[f5]=primaryPort,
+//   l()[f6]=secondaryIp, n()[f7]=secondaryPort, r()[f9]=ping config
+//   ("ping_min=&ping_avg=&ping_max=&ping_inc=", defaults 4/4/24/4).
+message ProvisionReply {
+  optional int32 async_id       = 1;
+  optional int32 result         = 2;  // 1000 = OK
+  optional bytes device_token   = 3;
+  optional bytes primary_ip     = 4;  // message server host
+  optional int32 primary_port   = 5;  // message server port
+  optional bytes secondary_ip   = 6;
+  optional int32 secondary_port = 7;
+  optional int32 field8         = 8;  // unused by handler
+  optional bytes ping_config    = 9;  // "ping_min=4&ping_avg=4&ping_max=24&ping_inc=4"
+}

@@ -1,0 +1,15 @@
+{
+  "name": "lightswitch",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Private server emulator for Samsung ChatON (com.sec.chaton 1.10.3). GLD provisioning over HTTPS + protobuf push channel over TLS, reverse-engineered from the APK.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "test": "node test/selftest.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "protobufjs": "^8.8.0"
+  }
+}
