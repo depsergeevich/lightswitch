@@ -28,13 +28,15 @@ message InitRequest {
   optional bytes push_reg_id = 2;   // j.b(null) — device push registration id
 }
 
-// --- type 1 --- i.writeTo: writeInt32(1), writeInt32(2), writeBytes(3)
-// Client (push/c/a/b.java): result = f() [field 1], async_id = d() [field 2];
-// requires async_id == request.async_id, and result == 1000 for success.
+// --- type 1 --- i.writeTo: writeInt32(1, this.c), writeInt32(2, this.d), writeBytes(3)
+// Client (push/c/a/b.java InitMessageTask.onResponse): the getter d() returns this.c
+// = FIELD 1 and is compared with the request's async id; f() returns this.d = FIELD 2
+// and is the result code (1000 = OK). (An earlier version of this schema had the two
+// swapped, so a real client silently dropped every InitReply and retried forever.)
 message InitReply {
-  optional int32 result   = 1;      // 1000 = OK; 4002/4006 => reconnect+reprov
-  optional int32 async_id = 2;      // echoes InitRequest.async_id
-  optional bytes payload  = 3;      // session/opaque; unused by client on success
+  optional int32 async_id = 1;      // d(): echo of InitRequest.async_id
+  optional int32 result   = 2;      // f(): 1000 = OK; 4002/4006 => reconnect+reprov
+  optional bytes payload  = 3;      // h(): unused by the client on success
 }
 
 // --- type 2 --- am.writeTo: writeInt32(1), writeBytes(2), writeBytes(3), writeBytes(4)
@@ -45,14 +47,16 @@ message RegistrationRequest {
   optional bytes extra       = 4;
 }
 
-// --- type 3 --- aj.writeTo: writeInt32(1), writeInt32(2), writeBytes(3..5)
-// Client (push/c/a/h.java): result = f() [field 1]; 1000 = success.
+// --- type 3 --- aj.writeTo: writeInt32(1), writeInt32(2), writeBytes(3,4,5)
+// Client (push/c/a/h.java RegistrationMessageTask.onResponse): d() = field 1 (async id,
+// must match the request), f() = field 2 (result, 1000 = OK), j() = field 4 (string; the
+// client stores it after a successful registration — we send the registration id there).
 message RegistrationReply {
-  optional int32 result   = 1;      // 1000 = OK
-  optional int32 async_id = 2;      // echoes request async_id
-  optional bytes reg_id   = 3;      // assigned push registration id
-  optional bytes field4   = 4;
-  optional bytes field5   = 5;
+  optional int32 async_id = 1;      // d()
+  optional int32 result   = 2;      // f(): 1000 = OK
+  optional bytes field3   = 3;      // h(): not read in the traced path
+  optional bytes reg_id   = 4;      // j(): stored by the client (j.c(...))
+  optional bytes field5   = 5;      // l()
 }
 
 // --- type 4 --- f (DeregistrationRequest) — fields TBD, trace push/c/a/a.java
@@ -61,10 +65,13 @@ message DeregistrationRequest {
   optional bytes push_reg_id = 2;
 }
 
-// --- type 5 --- c (DeregistrationReply)
+// --- type 5 --- c.writeTo: writeInt32(1), writeInt32(2), writeBytes(3,4)
+// Same layout as the other replies: d() = field 1 (async id), f() = field 2 (result).
 message DeregistrationReply {
-  optional int32 result   = 1;
-  optional int32 async_id = 2;
+  optional int32 async_id = 1;
+  optional int32 result   = 2;
+  optional bytes field3   = 3;
+  optional bytes field4   = 4;
 }
 
 // --- type 6 --- aa.writeTo: writeInt32(1), writeInt64(2), writeInt32(3)
@@ -83,18 +90,21 @@ message PingReply {
 }
 
 // --- type 8 --- r.writeTo: bytes(1,2), int32(3,4), bytes(5,6,7), int64(11), int32(12), bytes(13)
-// A single push notification element (a delivered event: message, buddy event, etc.)
+// A single push notification. Names below are taken from how the CLIENT consumes
+// it (push/c/a/d.java broadcasts getters d/l/n/p/r/t/v as the Config.NOTIFICATION_
+// INTENT_* extras): d()=field1, l()=field5, n()=field6, p()=field7, r()=field11,
+// t()=field12, v()=field13. Fields 2, 3, 4 are read by nothing we traced.
 message NotiElement {
-  optional bytes noti_id   = 1;
-  optional bytes sender    = 2;
-  optional int32 type      = 3;
-  optional int32 subtype   = 4;
-  optional bytes target    = 5;
-  optional bytes body      = 6;     // payload (often JSON/text)
-  optional bytes extra     = 7;
-  optional int64 timestamp = 11;
-  optional int32 seq       = 12;
-  optional bytes aux       = 13;
+  optional bytes noti_id      = 1;   // d()  NOTIID — what NotiAcks acknowledges
+  optional bytes field2       = 2;   // f()  unused in the traced receive path
+  optional int32 field3       = 3;   // h()
+  optional int32 field4       = 4;   // j()
+  optional bytes sender       = 5;   // l()  NOTIFICATION_INTENT_SENDER
+  optional bytes msg          = 6;   // n()  NOTIFICATION_INTENT_MSG  (message text)
+  optional bytes app_data     = 7;   // p()  NOTIFICATION_INTENT_APP_DATA
+  optional int64 timestamp    = 11;  // r()  NOTIFICATION_INTENT_TIMESTAMP
+  optional int32 conn_term    = 12;  // t()  NOTIFICATION_INTENT_CONNECTION_TERM
+  optional bytes session_info = 13;  // v()  NOTIFICATION_INTENT_SESSION_INFO
 }
 
 // --- type 9 --- u.writeTo: writeMessage(1, repeated) — a batch of NotiElement
@@ -130,8 +140,8 @@ message ProvisionRequest {
 //   l()[f6]=secondaryIp, n()[f7]=secondaryPort, r()[f9]=ping config
 //   ("ping_min=&ping_avg=&ping_max=&ping_inc=", defaults 4/4/24/4).
 message ProvisionReply {
-  optional int32 async_id       = 1;
-  optional int32 result         = 2;  // 1000 = OK
+  // (no field 1: ad.writeTo starts at field 2, and the client does not check an async id)
+  optional int32 result         = 2;  // d(): 1000 = OK
   optional bytes device_token   = 3;
   optional bytes primary_ip     = 4;  // message server host
   optional int32 primary_port   = 5;  // message server port

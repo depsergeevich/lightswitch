@@ -100,8 +100,8 @@ LS_PUBLIC_HOST=192.168.0.20 sudo -E npm start
 `LS_GLD_PORT` / `LS_PUSH_PORT`, and always set `LS_PUBLIC_HOST` to the IP the
 **device** can reach (advertised in the provisioning reply).
 
-Env vars: `LS_PUSH_TLS` (1), `LS_REST_TLS` (1), `LS_GLD_PORT` (443),
-`LS_GLD_HTTP_PORT` (80), `LS_PUSH_PORT` (5223), `LS_PUBLIC_HOST` (127.0.0.1),
+Env vars: `LS_PUSH_TLS` (0), `LS_REST_TLS` (0), `LS_GLD_PORT` (443),
+`LS_GLD_HTTP_PORT` (80), `LS_PUSH_PORT` (5223), `LS_PUBLIC_HOST` (192.168.0.20),
 `LS_BIND_HOST` (0.0.0.0), `LS_CERT_DIR`, `LS_PROV_TTL_MS`. For a fully plaintext
 setup use the included patched APK with `LS_PUSH_TLS=0 LS_REST_TLS=0`.
 
@@ -198,6 +198,76 @@ apktool b chaton_src -o chaton_patched.apk   # then sign
 > (Or sidestep certs on these calls entirely with `LS_REST_TLS=0` — plaintext
 > REST — pairing naturally with the SSL-off APK.)
 
+## Persistence (SQLite)
+
+State is kept in a single SQLite file (default `server/data/lightswitch.db`, WAL mode;
+override with `LS_DB=/path/to.db`, or `LS_DB=:memory:` for a throwaway run). It uses
+Node's built-in `node:sqlite`, so **Node >= 22.13** is required and nothing native has
+to be compiled (Node may print an `ExperimentalWarning` — harmless).
+
+| Table | Holds |
+|-------|-------|
+| `accounts`, `account_numbers` | registered users and every number/id that resolves to them |
+| `friends` | friendships (de-duplicated) |
+| `sms_tokens` | SMS auth tokens + codes (purged after 24 h) |
+| `ip_bindings` | device IP -> account, used to route push messages |
+| `queue` | undelivered push notifications, per account — delivered when the device connects, deleted on `NotiAcks` |
+| `messages` | history of everything routed through the server |
+
+- Schema version is tracked in `PRAGMA user_version`; a DB from a *newer* server is
+  refused instead of being corrupted.
+- Console: `accounts`, `history [n]` (last n routed messages), `say <number> <text>`.
+- Back up by copying the `.db` file (plus `-wal`/`-shm` if the server is running), or
+  inspect it with the `sqlite3` CLI: `sqlite3 server/data/lightswitch.db 'select * from accounts'`.
+- To reset everything, stop the server and delete `server/data/`.
+- Runtime-only (not stored): which push sessions are connected right now.
+
+## Pitfalls learned from real-client logs
+
+Every item below was found by running a real ChatON 1.10.3 and reading the server log,
+and each one is pinned by a regression test in `test/selftest.js` (several decode raw
+bytes captured from a real client, *independently* of our own `.proto`):
+
+- **Push replies: field 1 = async id, field 2 = result.** The client reads `InitReply`/
+  `RegistrationReply` with `d()` = field 1 (must equal its request id) and `f()` = field 2
+  (1000 = OK). With the two swapped the client silently drops the reply, closes the socket
+  after a few ms and retries forever — it never even sends `RegistrationRequest`.
+  (Symptom in the log: every push connection lives ~5 ms, `say` reports `0 live session(s)`.)
+- **`GET /v3/buddies` is always `mode=blocked`.** That is the client's normal full buddy-list
+  sync, not a request for blocked users — never answer it with an empty list.
+- **Address bodies are `<address name="Bob">+7999…</address>`** (the number is the element
+  text, the name an attribute) — not a nested `<value>` tag.
+- **Phone numbers arrive in whatever shape the country picker produced** (`+19917886095`,
+  `79917886095`, `89917886095` for an account registered as `9917886095`), so lookup matches by
+  digit suffix (>= 7 digits) after trying an exact match.
+- **`POST /address` is a phone-book upload.** Contacts who are registered show up as friends
+  automatically (as in the original service). The server keeps only the resulting
+  friendships and **never prints or stores the contact list**.
+
+## Debugging against a live device
+
+- `LS_DEBUG=1` hex-dumps every raw byte chunk received on the push socket, so an
+  unmodelled frame (e.g. the client's outbound chat message) can be decoded by hand.
+  Frames with an unknown type id are logged with `raw=<hex>` as well.
+- REST request bodies that are binary (e.g. `POST /notification`) are logged as
+  `body(binary NB hex)=…` instead of garbled text; gzip bodies are decompressed first.
+- Operator console (type into the server's stdin):
+  - `accounts` — list registered accounts
+  - `say <number> <text>` — send a message to a registered account from the server;
+    quickest way to check inbound delivery on a real phone
+  - `notify <pushRegId> <text>` — low-level push to one push registration id
+- **Account <-> push session binding is by device IP.** Push frames carry no `uid`,
+  but REST calls do and come from the same device, so the server remembers
+  `ip -> uid`. Fine on a LAN; two devices behind one NAT IP would collide.
+- **Delivered NotiElement fields** (verified against the client's receive path,
+  `push/c/a/d.java`): field 5 = sender, field 6 = message text, field 13 = session
+  info, field 11 = timestamp, field 1 = notification id (what `NotiAcks` echoes).
+
+> Outbound chat (client -> server) is still **unverified on hardware**: the router in
+> `index.js` is experimental and only resolves a recipient from phone-number-like
+> tokens in `app_data`/`session_info`. Capture one real send with `LS_DEBUG=1` to pin
+> the true format.
+
 ## Next steps
 
 - **Messaging between two accounts** (the headline feature). Buddy add/list is
@@ -212,5 +282,4 @@ apktool b chaton_src -o chaton_patched.apk   # then sign
 - **Own profile / "My page"**: `/profile/…` so the profile screen shows the
   registered name/avatar.
 - **File/media server** (avatars, image messages) — the `file` provisioning role.
-- Persist the store (swap `store.js` for `node:sqlite`, Node ≥ 22.5).
 ```

@@ -35,6 +35,21 @@ function parseBody(raw) {
 // (util/o.java). Provisioning entries are classified by Server.name in
 // {"contact","message","file","sms"} (d/a/ai.java, ah.java).
 
+// The client serialises an `Address` (value + optional name/group) as
+//   <address name="Bob">+79991112233</address>      (value = element TEXT, name = attribute)
+// not as a nested <value> tag. We accept that form and, defensively, the nested one.
+function extractAddresses(raw) {
+  const out = [];
+  const re = /<address\b[^>]*>([\s\S]*?)<\/address>/g;
+  let m;
+  while ((m = re.exec(raw)) !== null) {
+    const nested = /<value>([^<]*)<\/value>/.exec(m[1]);
+    const text = (nested ? nested[1] : m[1].replace(/<[^>]*>/g, '')).trim();
+    text.split(',').map((t) => t.trim()).filter(Boolean).forEach((t) => out.push(t));
+  }
+  return out;
+}
+
 // Extract every occurrence of a leaf tag (e.g. all <value> in an address list).
 function extractAll(raw, tag) {
   const out = [];
@@ -141,12 +156,12 @@ class GldServer {
 
   // Build a Buddy entry (io.entry.inner.Buddy) from an account. `value` is the
   // buddy's number/id (Entry.value); no avatar => imgstatus NONE_PROFILE ("3").
-  _buddy(acct) {
+  _buddy(acct, orgnum) {
     return {
       value: acct.msisdn,
       name: acct.name || acct.msisdn,
       status: acct.status || '',
-      orgnum: acct.msisdn,
+      orgnum: orgnum ? String(orgnum).replace(/^\+/, '') : acct.msisdn,
       orgname: acct.name || '',
       showphonenumber: true,
       imgstatus: '3',
@@ -172,8 +187,14 @@ class GldServer {
         try { buf = zlib.inflateSync(buf); } catch (_) { try { buf = zlib.inflateRawSync(buf); } catch (e) { log.warn('inflate failed', e.message); } }
       }
       const raw = buf.toString('utf8');
-      const body = raw ? parseBody(raw) : null;
-      log.info(req.method, p, Object.fromEntries(q.entries()), raw ? `body=${raw.replace(/\s+/g, ' ').slice(0, 500)}` : '');
+      const binary = buf.length > 0 && /[\x00-\x08\x0E-\x1F\uFFFD]/.test(raw);
+      const body = raw && !binary ? parseBody(raw) : null;
+      // Remember which device IP belongs to which account (used to route push messages).
+      const ip = String(req.socket.remoteAddress || '').replace(/^::ffff:/, '');
+      if (q.get('uid') && this.store.accounts.has(q.get('uid'))) this.store.bindIp(ip, q.get('uid'));
+      const SENSITIVE = new Set(['/address']); // phone-book uploads: never echo to the console
+      const shown = SENSITIVE.has(p) ? `body=<${extractAddresses(raw).length} contacts, not logged>` : binary ? `body(binary ${buf.length}B hex)=${buf.toString('hex').slice(0, 400)}` : `body=${raw.replace(/\s+/g, ' ').slice(0, 500)}`;
+      log.info(req.method, p, Object.fromEntries(q.entries()), raw ? shown : '');
       this._route(req, res, u, q, body, raw);
     });
   }
@@ -198,36 +219,62 @@ class GldServer {
     }
 
     // --- post-login screens (empty but well-formed so populated data works later) ---
+    if (p === '/notification') {
+      return this._json(res, {}, p); // binary (protobuf) body is hex-dumped above
+    }
+    if (p === '/inbox') {
+      return this._json(res, {}, p); // "mark as read" ack
+    }
     if (p === '/compatibility') {
       return this._json(res, {}, p); // capability ack; client only needs success
     }
     // --- buddies ---
+    // Add / preview a buddy by phone number(s). Body: <address>+N</address>... Modes seen in
+    // the client: preview (look up), call (add one), multiple (add several). Reply: GetBuddyList.
     if (p === '/v3/buddy') {
-      // Add / preview a buddy by phone number(s). Body: <address><value>+N</value></address>...
-      // mode=call/multiple => add; mode=preview => just look up. Reply: GetBuddyList.
       const mode = q.get('mode') || 'call';
       const me = this.store.accounts.get(q.get('uid'));
-      const numbers = extractAll(raw || '', 'value').flatMap((v) => v.split(',')).map((v) => v.trim()).filter(Boolean);
+      const numbers = extractAddresses(raw || '');
       const buddies = [];
       for (const num of numbers) {
         const acct = this.store.findByNumber(num);
-        if (!acct) continue; // not a registered ChatON user
+        if (!acct || (me && acct.uid === me.uid)) continue; // unknown number, or yourself
         if (mode !== 'preview' && me) this.store.addFriend(me.uid, acct.msisdn);
-        buddies.push(this._buddy(acct));
+        buddies.push(this._buddy(acct, num));
       }
-      log.info(`buddy ${mode}: ${numbers.join(',')} -> ${buddies.length} found`);
+      log.info(`buddy ${mode}: ${numbers.length} number(s) -> ${buddies.length} found`);
       return this._json(res, { buddy: buddies }, p);
     }
+    // "Is this number on ChatON?" (GET /check/<number>) -> GetBuddyList
+    if (p.startsWith('/check/')) {
+      const num = decodeURIComponent(p.slice('/check/'.length));
+      const acct = this.store.findByNumber(num);
+      return this._json(res, { buddy: acct ? [this._buddy(acct, num)] : [] }, p);
+    }
+    // Full buddy-list sync. NOTE: the real client ALWAYS sends mode=blocked here (it is the
+    // standard "get all buddies" call, with blocked ones flagged), so the mode must not be
+    // used to return an empty list.
     if (p === '/v3/buddies') {
-      // mode=blocked -> empty; otherwise the requester's friends.
-      const mode = q.get('mode');
       const me = this.store.accounts.get(q.get('uid'));
-      if (mode === 'blocked' || !me) return this._json(res, { timestamp: Date.now(), buddy: [] }, p);
-      const buddy = this.store.getFriends(me.uid)
-        .map((num) => this.store.findByNumber(num))
-        .filter(Boolean)
-        .map((acct) => this._buddy(acct));
+      const buddy = me
+        ? this.store.getFriends(me.uid).map((n) => this.store.findByNumber(n)).filter(Boolean).map((a) => this._buddy(a))
+        : [];
       return this._json(res, { timestamp: Date.now(), buddy }, p);
+    }
+    // Phone-book upload (<address name="Bob">NUMBER</address> x N). In the original service,
+    // contacts who were on ChatON showed up as friends automatically — do the same, and keep
+    // nothing but the resulting friendships (the contact list itself is not stored or logged).
+    if (p === '/address') {
+      const me = this.store.accounts.get(q.get('uid'));
+      let matched = 0;
+      if (me && q.get('mode') !== 'delete') {
+        for (const num of extractAddresses(raw || '')) {
+          const acct = this.store.findByNumber(num);
+          if (acct && acct.uid !== me.uid) { this.store.addFriend(me.uid, acct.msisdn); matched++; }
+        }
+      }
+      log.info(`contacts uploaded for ${me ? me.name : '?'}: ${matched} matched a registered account`);
+      return this._json(res, {}, p);
     }
     if (p === '/inboxes') {
       return this._json(res, { msg: [] }, p); // GetUnReadMessageList

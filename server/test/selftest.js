@@ -19,6 +19,9 @@ const CERT_DIR = path.join(__dirname, '..', '..', 'certs');
 process.env.LS_CERT_DIR = CERT_DIR;
 process.env.LS_GLD_PORT = process.env.LS_GLD_PORT || '14443';
 process.env.LS_PUSH_PORT = process.env.LS_PUSH_PORT || '15223';
+process.env.LS_GLD_HTTP_PORT = process.env.LS_GLD_HTTP_PORT || '14080'; // avoid needing port 80
+process.env.LS_PUSH_TLS = '1'; // the test drives the TLS path; plaintext is tested separately
+process.env.LS_REST_TLS = '1';
 process.env.LS_PUBLIC_HOST = '127.0.0.1';
 process.env.LS_BIND_HOST = '127.0.0.1';
 
@@ -188,12 +191,12 @@ async function run() {
   // --- buddy add + list between two accounts ---
   const A = store.register({ msisdn: '70001112233', name: 'Alice' });
   const B = store.register({ msisdn: '70004445566', name: 'Bob' });
-  const addRes = (await httpsRaw('POST', `/v3/buddy?uid=${A.uid}&mode=call`, '<param><address><value>+70004445566</value></address></param>')).body;
+  const addRes = (await httpsRaw('POST', `/v3/buddy?uid=${A.uid}&mode=call`, '<param> <address>+70004445566</address> </param>')).body;
   check(addRes.buddy.length === 1 && addRes.buddy[0].name === 'Bob', 'add-buddy finds and returns Bob', addRes);
   check(addRes.buddy[0].value === '70004445566', 'added buddy has value=number', addRes.buddy[0]);
-  const listRes = (await httpsReq('GET', `/v3/buddies?uid=${A.uid}&mode=all`)).body;
-  check(listRes.buddy.some((x) => x.name === 'Bob'), 'buddy list shows the added friend', listRes);
-  const unknown = (await httpsRaw('POST', `/v3/buddy?uid=${A.uid}&mode=call`, '<param><address><value>+79999999999</value></address></param>')).body;
+  const listRes = (await httpsReq('GET', `/v3/buddies?uid=${A.uid}&mode=blocked&timestamp=0`)).body;
+  check(listRes.buddy.some((x) => x.name === 'Bob'), 'buddy list (mode=blocked, as the real client calls it) shows the added friend', listRes);
+  const unknown = (await httpsRaw('POST', `/v3/buddy?uid=${A.uid}&mode=call`, '<param> <address>+79999999999</address> </param>')).body;
   check(unknown.buddy.length === 0, 'adding an unregistered number returns no buddy', unknown);
   const vn = (await httpsReq('GET', '/version/versionnotidis?imei=1&platform=android')).body;
   check(vn.uptodate === true && vn.needPopup === false, '/version/versionnotidis says up-to-date', vn);
@@ -226,7 +229,7 @@ async function run() {
       m = await conn.next();
       check(m.name === 'RegistrationReply', 'got RegistrationReply', m.name);
       check(m.body.result === 1000, 'RegistrationReply result=1000', m.body.result);
-      check(s(m.body.reg_id) === REG, 'RegistrationReply returns reg_id', s(m.body.reg_id));
+      check(s(m.body.reg_id).length === 32, 'RegistrationReply carries an issued registration id (field 4)', s(m.body.reg_id));
 
       // Ping / heartbeat echo
       const ts = Date.now();
@@ -242,11 +245,11 @@ async function run() {
       check(m.name === 'NotiGroup', 'got NotiGroup', m.name);
       const el = m.body.elements && m.body.elements[0];
       check(!!el, 'NotiGroup has an element');
-      check(el && s(el.body) === 'hello from the void', 'NotiElement body intact', el && s(el.body));
-      check(el && s(el.sender) === 'alice', 'NotiElement sender intact', el && s(el.sender));
+      check(el && s(el.msg) === 'hello from the void', 'NotiElement msg (field 6) intact', el && s(el.msg));
+      check(el && s(el.sender) === 'alice', 'NotiElement sender (field 5) intact', el && s(el.sender));
 
       // Ack it; queue should drain
-      conn.send('NotiAcks', { ids: [b(String(el.seq))] });
+      conn.send('NotiAcks', { ids: [el.noti_id] });
       await new Promise((r) => setTimeout(r, 50));
       check(store.drain(REG).length === 0, 'queue drained after ack', store.drain(REG).length);
 
@@ -258,6 +261,173 @@ async function run() {
       resolve();
     });
   });
+
+  // --- number matching: the client is inconsistent about +CC / trunk prefixes ---
+  const NUM = store.register({ msisdn: '9917886095', name: 'Fuzzy' }); // registered like the real log: no country code
+  for (const variant of ['+19917886095', '79917886095', '89917886095', '+9917886095', '9917886095']) {
+    check((store.findByNumber(variant) || {}).uid === NUM.uid, `findByNumber matches "${variant}"`, variant);
+  }
+  check(store.findByNumber('+7991788') === null || store.findByNumber('12345') === null, 'too-short numbers do not fuzzy-match');
+  const chk = (await httpsReq('GET', '/check/%2B19917886095?uid=' + A.uid + '&imei=1')).body;
+  check(chk.buddy.length === 1 && chk.buddy[0].name === 'Fuzzy', '/check/<number> finds a user by +1 variant', chk);
+  const prev = (await httpsRaw('POST', `/v3/buddy?uid=${A.uid}&mode=preview`, '<param> <address>+19917886095</address> </param>')).body;
+  check(prev.buddy.length === 1 && prev.buddy[0].value === '9917886095', 'preview of "+1…" finds the account registered without a country code', prev);
+  check(store.getFriends(A.uid).indexOf('9917886095') === -1, 'preview does not add a friend');
+
+  // --- phone-book upload: auto-friend matches, and never print the contact list ---
+  const logged = [];
+  const origLog = console.log;
+  console.log = (...a) => { logged.push(a.join(' ')); };
+  const upXml = '<param> <address name="Mum">+79990001234</address> <address name="Fuzzy Friend">89917886095</address> <address name="Nobody">+15550000000</address> </param>';
+  await httpsRaw('POST', `/address?uid=${A.uid}&mode=new`, upXml);
+  console.log = origLog;
+  const dump = logged.join('\n');
+  check(store.getFriends(A.uid).includes('9917886095'), '/address upload auto-adds contacts that are registered', store.getFriends(A.uid));
+  check(!dump.includes('79990001234') && !dump.includes('Mum') && !dump.includes('15550000000'), 'contact numbers/names are NOT written to the log', dump.slice(0, 300));
+  check(dump.includes('3 contacts, not logged'), 'upload is logged as a count only', dump.slice(0, 300));
+
+  // --- message routing between two accounts (IP-bound sessions) ---
+  const C = store.register({ msisdn: '70001110001', name: 'Carol' });
+  const D = store.register({ msisdn: '70001110002', name: 'Dave' });
+  store.bindIp('127.0.0.1', D.uid); // Dave's device = the local test client
+  store.bindIp('10.9.9.9', C.uid);  // Carol's device = a pretend remote sender
+  await new Promise((resolve) => {
+    const socket = tlsClient(async () => {
+      const conn = makeConn(socket);
+      conn.send('InitRequest', { async_id: 31, push_reg_id: b('dave-dev') });
+      await conn.next('InitReply (dave)');
+      conn.send('RegistrationRequest', { async_id: 32, push_reg_id: b('dave-dev') });
+      await conn.next('RegistrationReply (dave)');
+
+      // Carol "sends" a chat message addressed to Dave through the router.
+      const fakeCarolSession = { socket: { remoteAddress: '::ffff:10.9.9.9' } };
+      push.router = (sess, info) => {
+        const from = store.accounts.get(push._uid(sess));
+        const to = (`${info.app_data}`.match(/\+?\d{5,}/g) || []).map((t) => store.findByNumber(t)).filter(Boolean);
+        to.forEach((acct) => push.notifyUid(acct.uid, { sender: from.msisdn, msg: info.msg, app_data: info.app_data }));
+        return to.length;
+      };
+      const routed = push.router(fakeCarolSession, { msg: 'привет, Dave!', app_data: 'to=+70001110002' });
+      check(routed === 1, 'router resolves Dave from app_data', routed);
+
+      const m = await conn.next('NotiGroup (dave)');
+      const el = m.body.elements && m.body.elements[0];
+      check(m.name === 'NotiGroup' && !!el, "Dave's session receives a NotiGroup", m.name);
+      check(el && s(el.sender) === '70001110001', 'delivered sender = Carol (field 5)', el && s(el.sender));
+      check(el && s(el.msg) === 'привет, Dave!', 'delivered text intact incl. UTF-8 (field 6)', el && s(el.msg));
+      conn.send('NotiAcks', { ids: [el.noti_id] });
+      await new Promise((r) => setTimeout(r, 50));
+      check(store.peekUid(D.uid).length === 0, "Dave's account queue drained after ack", store.peekUid(D.uid).length);
+      socket.end();
+      resolve();
+    });
+    socket.on('error', (e) => { check(false, 'routing client connect', e.message); resolve(); });
+  });
+
+  // offline recipient: message queues, then arrives when the session comes up
+  const queued = push.notifyUid(C.uid, { sender: 'x', msg: 'offline-msg' });
+  check(queued.sessions === 0 && store.peekUid(C.uid).length === 1, 'message to an offline account is queued', queued.sessions);
+
+  // --- SQLite persistence: data must survive close + reopen of the DB file ---
+  {
+    const fsx = require('fs');
+    const osx = require('os');
+    const dir = fsx.mkdtempSync(path.join(osx.tmpdir(), 'ls-db-'));
+    const file = path.join(dir, 'nested', 'test.db'); // also checks the data dir is created
+    let db1 = new Store(file);
+    const P = db1.register({ msisdn: '70005550001', name: 'Persist-A', imei: 'imei-p' });
+    const Q = db1.register({ msisdn: '70005550002', name: 'Persist-B' });
+    db1.addFriend(P.uid, '+70005550002');
+    db1.addFriend(P.uid, '70005550002'); // duplicate must not create a second row
+    db1.bindIp('10.1.1.1', P.uid);
+    db1.enqueueUid(Q.uid, { sender: '70005550001', msg: 'saved while offline', noti_id: 'n-1' });
+    db1.enqueueUid(Q.uid, { sender: '70005550001', msg: 'second' });
+    db1.logMessage({ sender: '70005550001', uid: Q.uid, text: 'hello history' });
+    const tok = db1.issueToken('555');
+    const code = db1.sendSms(tok, '555');
+    db1.close();
+
+    const db2 = new Store(file); // "server restart"
+    check(db2.stats().accounts === 2, 'accounts survive a restart', db2.stats());
+    check(db2.findByNumber('+70005550001').name === 'Persist-A', 'account found by number after restart');
+    check(JSON.stringify(db2.getFriends(P.uid)) === JSON.stringify(['70005550002']), 'friendship survives (and was de-duplicated)', db2.getFriends(P.uid));
+    check(db2.uidForIp('10.1.1.1') === P.uid, 'ip -> account binding survives');
+    const pend = db2.peekUid(Q.uid);
+    check(pend.length === 2 && pend[0].msg === 'saved while offline', 'undelivered messages survive, in order', pend.map((e) => e.msg));
+    check(db2.verify(tok, code) && !db2.verify(tok, '0000'), 'SMS token + code survive a restart');
+    check(db2.recentMessages(5)[0].text === 'hello history', 'message history is logged and survives');
+    const R = db2.register({ msisdn: '70005550003', name: 'Persist-C' });
+    check(Number(R.uid.slice(1)) > Number(Q.uid.slice(1)), 'uid sequence continues after restart', [Q.uid, R.uid]);
+    db2.register({ msisdn: '70005550001', name: 'Persist-A2' }); // re-register keeps the same uid
+    check(db2.findByNumber('70005550001').uid === P.uid && db2.findByNumber('70005550001').name === 'Persist-A2', 're-registering keeps the uid and updates the name');
+    db2.ackUid(Q.uid, ['n-1']); // ack by noti_id
+    db2.ackUid(Q.uid, [String(pend[1].seq)]); // ack by seq
+    check(db2.peekUid(Q.uid).length === 0, 'acks (by noti_id and by seq) delete from the queue', db2.peekUid(Q.uid).length);
+    db2.close();
+    fsx.rmSync(dir, { recursive: true, force: true });
+  }
+
+  // --- wire regression with frames captured from a real ChatON 1.10.3 client ---
+  // The client reads InitReply with getters d() = FIELD 1 (must equal its request async id)
+  // and f() = FIELD 2 (result, 1000 = OK). Decode our raw reply the same way, independently
+  // of our own .proto, so a field-number mix-up cannot hide behind a symmetric test.
+  function pbFields(buf) { // minimal protobuf reader: { fieldNo: value | Buffer }
+    const out = {}; let i = 0;
+    const varint = () => { let r = 0n, sh = 0n; for (;;) { const c = buf[i++]; r |= BigInt(c & 0x7f) << sh; if (!(c & 0x80)) break; sh += 7n; } return r; };
+    while (i < buf.length) {
+      const key = Number(varint()); const f = key >> 3; const w = key & 7;
+      if (w === 0) out[f] = Number(BigInt.asIntN(32, varint()));
+      else if (w === 2) { const n = Number(varint()); out[f] = buf.subarray(i, i + n); i += n; }
+      else if (w === 1) { out[f] = buf.subarray(i, i + 8); i += 8; }
+      else throw new Error('wire type ' + w);
+    }
+    return out;
+  }
+  const net2 = require('net');
+  const wirePort = config.pushPort + 2;
+  const pushWire = new PushServer({ ...config, pushTls: false, pushPort: wirePort }, new Store());
+  await pushWire.start();
+  const rawExchange = (hex) => new Promise((resolve, reject) => {
+    const sock = net2.connect(wirePort, '127.0.0.1', () => sock.write(Buffer.from(hex, 'hex')));
+    let got = Buffer.alloc(0);
+    sock.on('data', (c) => { got = Buffer.concat([got, c]); if (got.length >= 4 && got.length >= 4 + got.readUInt16BE(2)) { sock.end(); resolve(got); } });
+    sock.on('error', reject);
+    setTimeout(() => reject(new Error('no reply')), 3000);
+  });
+  const frameBody = (f) => ({ type: f[1], body: pbFields(f.subarray(4, 4 + f.readUInt16BE(2))) });
+
+  // captured: InitRequest async_id=2112580769 (79 B) and a negative one, async_id=-366026236 (84 B)
+  const captured = [
+    ['0000004b08a1d9adef0712436465766963652e6d6f64656c3d534d2d53393038452673696d2e6d63633d3236322673696d2e6d6e633d3037266e65742e6d63633d323632266e65742e6d6e633d3037', 2112580769],
+    ['000000500884c4bbd1feffffffff0112436465766963652e6d6f64656c3d534d2d53393038452673696d2e6d63633d3236322673696d2e6d6e633d3037266e65742e6d63633d323632266e65742e6d6e633d3037', -366026236],
+  ];
+  for (const [hex, asyncId] of captured) {
+    try {
+      const r = frameBody(await rawExchange(hex));
+      check(r.type === 1, `real InitRequest(${asyncId}) -> reply is type 1 (InitReply)`, r.type);
+      check(r.body[1] === asyncId, `client's d() (field 1) == its async id ${asyncId}`, r.body[1]);
+      check(r.body[2] === 1000, "client's f() (field 2) == 1000 (OK)", r.body[2]);
+    } catch (e) { check(false, 'raw InitRequest exchange', e.message); }
+  }
+  // captured ProvisionRequest -> the client reads result from field 2 and the server addr from 4/5
+  try {
+    const provHex = '000b00631201311a0f3238383630303035363739373138392208303030303030303032436465766963652e6d6f64656c3d534d2d53393038452673696d2e6d63633d3236322673696d2e6d6e633d3037266e65742e6d63633d323632266e65742e6d6e633d3037';
+    const rp = frameBody(await rawExchange(provHex));
+    check(rp.type === 12, 'real ProvisionRequest -> ProvisionReply (type 12)', rp.type);
+    check(rp.body[2] === 1000, 'ProvisionReply result in field 2 == 1000', rp.body[2]);
+    check(Buffer.isBuffer(rp.body[4]) && rp.body[4].length > 0 && rp.body[5] === wirePort, 'ProvisionReply: message server ip (field 4) + port (field 5)', { ip: String(rp.body[4]), port: rp.body[5] });
+    check(rp.body[1] === undefined, 'ProvisionReply has no field 1 (the real message does not)', rp.body[1]);
+  } catch (e) { check(false, 'raw ProvisionRequest exchange', e.message); }
+  // RegistrationRequest {1: async 77, 2: token, 3: app id "chaton", 4: ""} built per push/c/a/h.java
+  try {
+    const tok = Buffer.from('tok-1'), app = Buffer.from('chaton');
+    const body = Buffer.concat([Buffer.from([0x08, 77, 0x12, tok.length]), tok, Buffer.from([0x1a, app.length]), app, Buffer.from([0x22, 0])]);
+    const hdr = Buffer.from([0, 2, body.length >> 8, body.length & 255]);
+    const rr = frameBody(await rawExchange(Buffer.concat([hdr, body]).toString('hex')));
+    check(rr.type === 3 && rr.body[1] === 77 && rr.body[2] === 1000, 'real-layout RegistrationRequest -> async id in field 1, 1000 in field 2', rr.body);
+    check(Buffer.isBuffer(rr.body[4]) && rr.body[4].length > 0, 'RegistrationReply carries the registration id in field 4 (what the client stores)');
+  } catch (e) { check(false, 'raw RegistrationRequest exchange', e.message); }
+  pushWire.stop();
 
   // --- plaintext push (matches the smali SSL-off patch): plain TCP, same frames ---
   const net = require('net');
